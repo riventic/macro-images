@@ -1,0 +1,54 @@
+#!/bin/sh
+# Setup steps for a Macro deployment. Each step is idempotent: safe on every start.
+set -eu
+
+need() {
+  for v in "$@"; do
+    eval "val=\${$v:-}"
+    if [ -z "$val" ]; then
+      echo "macro-init: $v must be set" >&2
+      exit 2
+    fi
+  done
+}
+
+case "${1:-help}" in
+  migrate)
+    # Create the database if missing, then apply the sqlx migrations of
+    # crates/macro_db_client at the release tag.
+    need DATABASE_URL
+    sqlx database create
+    sqlx migrate run --source /macro/migrations
+    ;;
+  opensearch)
+    # Create every search index + alias (upstream infra/stacks/opensearch/helpers).
+    # ENVIRONMENT must not be `prod` on a single node: `prod` asks for 2 replicas.
+    need OPENSEARCH_URL OPENSEARCH_USERNAME OPENSEARCH_PASSWORD
+    cd /macro/opensearch-helpers
+    ENVIRONMENT="${ENVIRONMENT:-selfhost}" DRY_RUN=false exec bun run scripts/create_indices.ts
+    ;;
+  kafka-topics)
+    # Print the event topic names, one per line (upstream .github/kafka-cluster-topics.json).
+    exec bun -e 'for (const t of await Bun.file("/macro/kafka-topics.json").json()) console.log(t)'
+    ;;
+  version)
+    echo "${MACRO_VERSION:-unknown}"
+    ;;
+  help | *)
+    cat <<'EOF'
+macro-init <step>
+
+  migrate       create the database, run the migrations       needs DATABASE_URL
+  opensearch    create the search indices and aliases         needs OPENSEARCH_URL,
+                                                               OPENSEARCH_USERNAME,
+                                                               OPENSEARCH_PASSWORD
+  kafka-topics  print the Kafka topic names, one per line
+  version       print the Macro release tag
+
+Files for a deployment's own provisioning:
+  /macro/kafka-topics.json          event topics
+  /macro/fusionauth/templates/      FusionAuth lambdas + email templates
+EOF
+    [ "${1:-help}" = help ]
+    ;;
+esac
