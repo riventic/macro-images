@@ -21,6 +21,7 @@ All tagged with the upstream release tag (`v2026.10.26.1`, …). Pin by digest.
 | `macro-sync-service` | sync service (Rust → wasm, run by wrangler/workerd) | upstream `docker/sync-service.Dockerfile`, unchanged |
 | `macro-lexical-service` | lexical document service | upstream `docker/lexical-service.Dockerfile`, unchanged |
 | `macro-init` | one-shot setup: `migrate`, `opensearch`, `kafka-topics`, `version` (see `macro-init help`) | `sqlx-cli` 0.8.6 + upstream files at the tag + `images/init/Dockerfile` |
+| `macro-opensearch` | OpenSearch 3.5.0 with the `analysis-icu` plugin (upstream `infra/local/opensearch`) | `images/opensearch/Dockerfile` |
 
 `macro-init` contents: `/macro/migrations` (`crates/macro_db_client/migrations`), `/macro/opensearch-helpers` (`infra/stacks/opensearch/helpers`), `/macro/kafka-topics.json` (`.github/kafka-cluster-topics.json`), `/macro/fusionauth/templates` (`infra/stacks/fusionauth-instance/templates`). It does not create Kafka topics, S3 buckets, SQS queues, DynamoDB tables, KMS keys or the FusionAuth kickstart: those depend on the backends a deployment chooses. Upstream's list of AWS resources: `tooling/xtask/crates/xtask_local/src/local/resources.rs` + `localstack.rs`.
 
@@ -28,7 +29,7 @@ Binaries in `macro-services`: `agent_harness_service`, `authentication_service`,
 
 ## How a build runs
 
-`.github/workflows/build.yml` — manual (`workflow_dispatch`, optional `tag`, `force`) or daily (latest upstream release). Images are built per group — `services`, `web`, `node` (the three upstream Dockerfiles), `init` — and a group is built only when one of its images is missing for the tag. `force` names groups to rebuild anyway (`init,web`, or `all`).
+`.github/workflows/build.yml` — manual (`workflow_dispatch`, optional `tag`, `force`) or daily (latest upstream release). Images are built per group — `services`, `web`, `node` (the three upstream Dockerfiles), `init`, `opensearch` — and a group is built only when one of its images is missing for the tag. `force` names groups to rebuild anyway (`init,web`, or `all`).
 
 | Job | Token | Does |
 |---|---|---|
@@ -40,6 +41,7 @@ Binaries in `macro-services`: `agent_harness_service`, `authentication_service`,
 | `web-image` | `packages: write` | packages the artifact, pushes |
 | `init-build` | `contents: read` | builds `sqlx-cli`, stages upstream files, uploads an artifact |
 | `init-image` | `packages: write` | packages the artifact, runs the migrations twice against an empty Postgres, pushes |
+| `opensearch-image` | `packages: write` | builds stock OpenSearch + `analysis-icu`, checks the plugin is listed, pushes (runs no upstream Macro code) |
 
 Jobs that run upstream code (`build.rs`, install scripts) never hold a write token. Write jobs run upstream code only inside BuildKit containers, which cannot read the runner's registry login.
 
