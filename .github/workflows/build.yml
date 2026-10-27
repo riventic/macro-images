@@ -110,7 +110,9 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends cmake pkg-config libssl-dev
+          # libcurl headers: librdkafka's OAUTHBEARER/OIDC code includes curl.h
+          # (upstream builds in rust:latest, which ships them).
+          sudo apt-get install -y --no-install-recommends cmake pkg-config libssl-dev libcurl4-openssl-dev
           rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
       - name: Cache cargo
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
