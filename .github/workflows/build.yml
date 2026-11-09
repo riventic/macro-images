@@ -314,10 +314,25 @@ jobs:
     needs: resolve
     if: contains(fromJSON(needs.resolve.outputs.todo), 'web')
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 150
     permissions:
       contents: read
+    env:
+      RUSTUP_TOOLCHAIN: "1.94.0"
+      CARGO_INCREMENTAL: "0"
+      CARGO_TERM_COLOR: always
+      # wasm-bindgen-cli must equal the workspace's wasm-bindgen (Cargo.lock).
+      WASM_BINDGEN_VERSION: "0.2.126"
+      WASM_PACK_VERSION: "0.15.1"
+      JUST_VERSION: "1.59.0"
+      BINARYEN_VERSION: "133"
+      BINARYEN_SHA256: 2dc9c7813f5375db93d96ead4b78222fcc3e2677bbb832297af4797782a37489
     steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost /usr/local/.ghcup
+          df -h /
       - name: Check out upstream
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -331,15 +346,48 @@ jobs:
       - name: Install dependencies
         working-directory: upstream
         run: bun install --frozen-lockfile
+      - name: Install Rust and wasm tooling
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake pkg-config libssl-dev
+          rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --target wasm32-unknown-unknown
+          tools="$RUNNER_TEMP/tools"
+          cargo install --locked --root "$tools" \
+            "just@$JUST_VERSION" "wasm-pack@$WASM_PACK_VERSION" "wasm-bindgen-cli@$WASM_BINDGEN_VERSION"
+          # wasm-opt: pinned release + checksum, so wasm-pack does not fetch one itself.
+          b="binaryen-version_$BINARYEN_VERSION-x86_64-linux.tar.gz"
+          curl -fsSLo "$RUNNER_TEMP/$b" "https://github.com/WebAssembly/binaryen/releases/download/version_$BINARYEN_VERSION/$b"
+          echo "$BINARYEN_SHA256  $RUNNER_TEMP/$b" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/$b" -C "$tools"
+          echo "$tools/bin" >> "$GITHUB_PATH"
+          echo "$tools/binaryen-version_$BINARYEN_VERSION/bin" >> "$GITHUB_PATH"
+      - name: Build WebAssembly modules
+        working-directory: upstream/apps/web
+        # Upstream's static build runs `dev:prepare` first (xtask_local
+        # frontend::prepare_dependencies). The modules are gitignored, and Vite
+        # leaves a missing one's `new URL()` as is: the bundle builds, then
+        # cannot open that file type (PPTX, DOCX, Figma, PSD, ...).
+        run: |
+          set -euo pipefail
+          prepare=$(jq -r '.scripts["dev:prepare"] // empty' package.json)
+          [ -n "$prepare" ] || exit 0
+          bun run dev:prepare
+          want=$(grep -o 'ensure-[a-z0-9-]*-wasm' <<<"$prepare" | sort -u | wc -l)
+          have=$(find src/lib -path '*/wasm/*_bg.wasm' | wc -l)
+          echo "wasm modules: $have built, $want expected"
+          [ "$have" -ge "$want" ]
       - name: Build bundle
         working-directory: upstream/apps/web
         # Same env as upstream's static build (xtask_local frontend::build_static).
+        # No VITE_AI_EDITING_WORKER_URL: upstream sets it only with the AI
+        # editing worker, which this deploy does not run.
         env:
           MODE: development
           NODE_ENV: production
           VITE_LOCAL_SERVERS: ALL
           VITE_LOCAL_BACKEND_ORIGIN: same-origin
-          VITE_AI_EDITING_WORKER_URL: /ai-editing
+          VITE_LOCAL_ONLY: "true"
         run: |
           bun run --bun build
           test -f dist/index.html
