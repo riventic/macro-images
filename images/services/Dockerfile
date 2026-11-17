@@ -23,8 +23,10 @@ LABEL org.opencontainers.image.title="Macro services (unofficial)" \
       org.opencontainers.image.licenses="AGPL-3.0-only"
 
 # curl: upstream's compose healthchecks call it.
+# git: agent_harness_service checks for `git http-backend` at start-up (agent git
+# remotes, from v2026.11.16.1; upstream docker/Dockerfile.runtime).
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends ca-certificates curl dumb-init \
+  && apt-get install -y --no-install-recommends ca-certificates curl dumb-init git \
   && apt-get clean \
   && rm -rf /var/lib/apt/lists/*
 
