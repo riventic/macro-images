@@ -124,6 +124,23 @@ jobs:
           ref: ${{ needs.resolve.outputs.sha }}
           path: upstream
           persist-credentials: false
+      - name: Check out this repository (patches)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: images
+          persist-credentials: false
+      - name: Apply patches
+        working-directory: upstream
+        # A patch that no longer applies to a new tag fails the build: it is
+        # never skipped (README §Patches).
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          for p in ../images/patches/services/*.patch; do
+            echo "applying $p"
+            git apply --check "$p"
+            git apply "$p"
+          done
       - name: Install build dependencies
         run: |
           sudo apt-get update
@@ -225,6 +242,7 @@ jobs:
           build-args: |
             MACRO_VERSION=${{ env.TAG }}
             MACRO_REVISION=${{ env.SHA }}
+            MACRO_IMAGES_REVISION=${{ github.sha }}
       - name: Smoke test — every binary resolves its shared libraries
         run: |
           docker run --rm --entrypoint sh macro-services:test -c '
@@ -250,6 +268,7 @@ jobs:
           build-args: |
             MACRO_VERSION=${{ env.TAG }}
             MACRO_REVISION=${{ env.SHA }}
+            MACRO_IMAGES_REVISION=${{ github.sha }}
 
   # ------------------------------------------------- upstream Dockerfiles
   # These Dockerfiles are self-contained; build them unchanged.
