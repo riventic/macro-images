@@ -6,8 +6,18 @@ Not affiliated with or endorsed by Macro. Upstream does not publish server image
 
 ## What this repo holds
 
-- Build workflows and Dockerfiles only. No Macro source is copied here — each build checks out `macro-inc/macro` at an exact release tag.
-- Every image carries the label `org.opencontainers.image.source` + `org.opencontainers.image.revision` naming the upstream tag and commit it was built from (AGPL-3.0 §6: corresponding source).
+- Build workflows, Dockerfiles and a small set of source patches (§Patches). No Macro source is copied here — each build checks out `macro-inc/macro` at an exact release tag.
+- Every image carries the label `org.opencontainers.image.source` + `org.opencontainers.image.revision` naming the upstream tag and commit it was built from (AGPL-3.0 §6: corresponding source). `macro-services` also carries `ai.riventic.macro-images.revision`: the commit of this repo whose `patches/services/` was applied on top.
+
+## Patches
+
+`patches/services/*.patch` are applied with `git apply` to the upstream checkout before `cargo build`, in file-name order. A patch that no longer applies to a new tag fails the build; fix or drop it, never skip it. Only `macro-services` is patched.
+
+| Patch | Why |
+|---|---|
+| `0001-local-aws-env-credentials.patch` | In `ENVIRONMENT=local`, upstream `macro_aws_config::local_aws_config` signs every AWS request with the SDK's public test key (`ANOTREAL`). LocalStack accepts any key; an S3 that checks signatures (SeaweedFS) rejects all of them, and accepting the test key would let anyone who reaches the S3 endpoint sign requests, because its secret is published. The patch signs with `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` when they are set, else with the test key as before. |
+
+A patch changes the binaries of a tag that already has an image, so the daily build does not pick it up: run the workflow with `tag=<tag>` and `force=services`. That overwrites the tag, so deployments must pin by digest (they do).
 
 ## Images
 

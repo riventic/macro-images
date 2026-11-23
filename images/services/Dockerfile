@@ -14,8 +14,11 @@ FROM debian:trixie-slim@sha256:62bd423aeee912639ca8ee681c2b762cb3e25137e0a92b20b
 
 ARG MACRO_VERSION
 ARG MACRO_REVISION
+# Commit of this repo: its patches/services/ is applied on top of MACRO_REVISION.
+ARG MACRO_IMAGES_REVISION
 LABEL org.opencontainers.image.title="Macro services (unofficial)" \
-      org.opencontainers.image.description="Macro Rust service binaries, built from macro-inc/macro ${MACRO_VERSION}" \
+      org.opencontainers.image.description="Macro Rust service binaries, built from macro-inc/macro ${MACRO_VERSION} + riventic/macro-images patches/services at ${MACRO_IMAGES_REVISION}" \
+      ai.riventic.macro-images.revision="${MACRO_IMAGES_REVISION}" \
       org.opencontainers.image.source="https://github.com/riventic/macro-images" \
       org.opencontainers.image.url="https://github.com/macro-inc/macro/tree/${MACRO_VERSION}" \
       org.opencontainers.image.version="${MACRO_VERSION}" \
