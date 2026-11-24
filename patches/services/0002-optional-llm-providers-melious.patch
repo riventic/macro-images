@@ -1,0 +1,229 @@
+diff --git a/crates/agent/src/model/router.rs b/crates/agent/src/model/router.rs
+index a7c24dd9..fe778455 100644
+--- a/crates/agent/src/model/router.rs
++++ b/crates/agent/src/model/router.rs
+@@ -54,9 +54,6 @@ env_var! {
+     struct ApiKeys {
+         AnthropicApiKey,
+         OpenaiApiKey,
+-        CerebrasApiKey,
+-        /// Doppler name is `FIREWORK_API_KEY` (singular), from `shared_ai`.
+-        FireworkApiKey,
+         GoogleGenerativeAiApiKey
+     }
+ }
+@@ -75,6 +72,11 @@ const CEREBRAS_BASE_URL: &str = "https://api.cerebras.ai/v1";
+ const FIREWORKS_PROVIDER: &str = "fireworks";
+ /// Fireworks inference endpoint (OpenAI-compatible Chat Completions API).
+ const FIREWORKS_BASE_URL: &str = "https://api.fireworks.ai/inference/v1";
++/// Provider segment Melious is registered under (OpenAI-compatible Chat
++/// Completions, EU-hosted open-weight models).
++const MELIOUS_PROVIDER: &str = "melious";
++/// Melious inference endpoint; `MELIOUS_BASE_URL` overrides it.
++const MELIOUS_BASE_URL: &str = "https://api.melious.ai/v1";
+ /// Provider segment Google Gemini is registered under (native GenerateContent).
+ const GOOGLE_PROVIDER: &str = "google";
+ /// Output cap for OpenAI-compatible Chat Completions hosts, whose limits
+@@ -410,8 +412,11 @@ impl<H: HttpClientExt + Clone + 'static> ModelRouter<H> {
+ impl ModelRouter {
+     /// Build a router with the built-in providers from the environment.
+     ///
+-    /// Requires `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `CEREBRAS_API_KEY`,
+-    /// `FIREWORK_API_KEY`, and `GOOGLE_GENERATIVE_AI_API_KEY`. Chain
++    /// Requires `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, and
++    /// `GOOGLE_GENERATIVE_AI_API_KEY`. The OpenAI-compatible providers are
++    /// optional: each is registered only when its key is set
++    /// (`CEREBRAS_API_KEY`, `FIREWORK_API_KEY`, `MELIOUS_API_KEY`), so a
++    /// deployment without one starts and its ids are unroutable. Chain
+     /// `with_openai_provider` on the returned router to add more.
+     pub fn try_from_env() -> Result<ModelRouter<MeteredHttpClient>, AgentError> {
+         let env = ApiKeys::new()?;
+@@ -451,14 +456,21 @@ impl ModelRouter {
+                 WireProtocol::Gemini,
+             ))
+             .build()?;
+-        ModelRouter::new(anthropic, openai)
+-            .with_gemini_client(gemini)
+-            .with_openai_provider(CEREBRAS_PROVIDER, CEREBRAS_BASE_URL, &env.cerebras_api_key)?
+-            .with_openai_provider(
+-                FIREWORKS_PROVIDER,
+-                FIREWORKS_BASE_URL,
+-                &env.firework_api_key,
+-            )
++        let melious_base_url = macro_env_var::maybe_read_env("MELIOUS_BASE_URL")
++            .unwrap_or_else(|| MELIOUS_BASE_URL.to_owned());
++        let optional = [
++            (CEREBRAS_PROVIDER, CEREBRAS_BASE_URL.to_owned(), "CEREBRAS_API_KEY"),
++            // Doppler name is `FIREWORK_API_KEY` (singular), from `shared_ai`.
++            (FIREWORKS_PROVIDER, FIREWORKS_BASE_URL.to_owned(), "FIREWORK_API_KEY"),
++            (MELIOUS_PROVIDER, melious_base_url, "MELIOUS_API_KEY"),
++        ];
++        let mut router = ModelRouter::new(anthropic, openai).with_gemini_client(gemini);
++        for (provider, base_url, key_var) in optional {
++            if let Some(key) = macro_env_var::maybe_read_env(key_var).filter(|key| !key.is_empty()) {
++                router = router.with_openai_provider(provider, &base_url, &key)?;
++            }
++        }
++        Ok(router)
+     }
+ 
+     /// The process-wide full router, built from the environment on first use.
+diff --git a/crates/agent_inmem/src/domain/models.rs b/crates/agent_inmem/src/domain/models.rs
+index 191d007b..4348cb40 100644
+--- a/crates/agent_inmem/src/domain/models.rs
++++ b/crates/agent_inmem/src/domain/models.rs
+@@ -42,6 +42,69 @@ pub const ROUTED_MODELS: &[(&str, &str)] = &[
+     ("google/gemini-3.8-flash", "Gemini 3.8 Flash"),
+ ];
+ 
++/// A model the deployment's Melious key serves, discovered at container start.
++struct MeliousModel {
++    /// Routing id, `melious/<wire id>`.
++    id: &'static str,
++    context_window: u64,
++    supports_images: bool,
++}
++
++/// The Melious models in `MELIOUS_MODELS`: one model per line,
++/// `<wire id> <context window> <supports images: 0|1>`. The deployment writes
++/// it from `GET /v1/models?include_meta=true` before the service starts. A
++/// line that does not parse is dropped and logged, never guessed.
++fn melious_models() -> &'static [MeliousModel] {
++    static MODELS: OnceLock<Vec<MeliousModel>> = OnceLock::new();
++    MODELS.get_or_init(|| {
++        let Ok(list) = std::env::var("MELIOUS_MODELS") else {
++            return Vec::new();
++        };
++        list.lines()
++            .map(str::trim)
++            .filter(|line| !line.is_empty())
++            .filter_map(|line| {
++                let mut fields = line.split_whitespace();
++                let parsed = match (fields.next(), fields.next(), fields.next(), fields.next()) {
++                    (Some(wire), Some(window), Some(images), None) => window
++                        .parse::<u64>()
++                        .ok()
++                        .zip(match images {
++                            "1" => Some(true),
++                            "0" => Some(false),
++                            _ => None,
++                        })
++                        .map(|(window, images)| (wire, window, images)),
++                    _ => None,
++                };
++                let Some((wire, context_window, supports_images)) = parsed else {
++                    tracing::error!(line, "MELIOUS_MODELS: line dropped, want `<id> <window> <0|1>`");
++                    return None;
++                };
++                let id: &'static str = Box::leak(format!("melious/{wire}").into_boxed_str());
++                Some(MeliousModel { id, context_window, supports_images })
++            })
++            .collect()
++    })
++}
++
++fn melious_model(id: &str) -> Option<&'static MeliousModel> {
++    melious_models().iter().find(|model| model.id == id)
++}
++
++/// Whether the router registers `model`'s provider in this deployment. The
++/// OpenAI-compatible providers are optional (their key may be unset), so the
++/// picker must not offer an id that would fall back to the default model.
++pub(crate) fn provider_available(model: &str) -> bool {
++    let key = match model.split('/').next() {
++        Some("cerebras") => "CEREBRAS_API_KEY",
++        Some("fireworks") => "FIREWORK_API_KEY",
++        Some("melious") => "MELIOUS_API_KEY",
++        _ => return true,
++    };
++    std::env::var(key).is_ok_and(|value| !value.is_empty())
++}
++
+ /// House name for an advertised id, or the id itself when the catalog has
+ /// none (closed chat models keep their frontend names).
+ #[must_use]
+@@ -52,7 +115,8 @@ pub fn display_name(id: &str) -> &str {
+         .unwrap_or(id)
+ }
+ 
+-/// Auto, then the closed chat models, then the routed extras, in picker order.
++/// Auto, then the closed chat models, then the routed extras whose provider is
++/// configured, then the discovered Melious models, in picker order.
+ #[must_use]
+ pub fn advertised_models() -> &'static [&'static str] {
+     static MODELS: OnceLock<Vec<&'static str>> = OnceLock::new();
+@@ -62,10 +126,17 @@ pub fn advertised_models() -> &'static [&'static str] {
+             models.push(AUTO_MODEL);
+             models.extend_from_slice(CHAT_MODELS);
+             for (model, _) in ROUTED_MODELS {
+-                if !models.contains(model) {
++                if !models.contains(model) && provider_available(model) {
+                     models.push(model);
+                 }
+             }
++            if provider_available("melious/") {
++                for model in melious_models() {
++                    if !models.contains(&model.id) {
++                        models.push(model.id);
++                    }
++                }
++            }
+             models
+         })
+         .as_slice()
+@@ -95,7 +166,7 @@ pub fn supports_images(id: &str) -> Option<bool> {
+         "fireworks/glm-5p3"
+         | "fireworks/nemotron-lightning-3p5-30b-a3b"
+         | "cerebras/gpt-oss-120b" => Some(false),
+-        _ => None,
++        id => melious_model(id).map(|model| model.supports_images),
+     }
+ }
+ 
+@@ -127,7 +198,7 @@ pub fn context_window(id: &str) -> Option<u64> {
+         "fireworks/nemotron-lightning-3p5-30b-a3b" => 262_000,
+         "fireworks/muse-glimmer-30b" => 131_000,
+         "cerebras/gpt-oss-120b" => 131_072,
+-        _ => return None,
++        id => return melious_model(id).map(|model| model.context_window),
+     })
+ }
+ 
+diff --git a/crates/agent_inmem/src/domain/models/test.rs b/crates/agent_inmem/src/domain/models/test.rs
+index 67f71bbe..faaad9b5 100644
+--- a/crates/agent_inmem/src/domain/models/test.rs
++++ b/crates/agent_inmem/src/domain/models/test.rs
+@@ -1,4 +1,6 @@
+-use super::{AUTO_MODEL, ROUTED_MODELS, advertised_models, display_name, resolve};
++use super::{
++    AUTO_MODEL, ROUTED_MODELS, advertised_models, display_name, provider_available, resolve,
++};
+ use chat::domain::models::CHAT_MODELS;
+ 
+ #[test]
+@@ -13,15 +15,16 @@ fn advertised_models_lead_with_auto_then_chat_then_routed() {
+     );
+     assert_eq!(models[0], AUTO_MODEL);
+     assert_eq!(&models[1..=CHAT_MODELS.len()], CHAT_MODELS);
+-    assert_eq!(
+-        &models[CHAT_MODELS.len() + 1..],
+-        ROUTED_MODELS
+-            .iter()
+-            .map(|(model, _)| *model)
+-            .filter(|model| *model != AUTO_MODEL && !CHAT_MODELS.contains(model))
+-            .collect::<Vec<_>>()
+-            .as_slice()
+-    );
++    let routed = ROUTED_MODELS
++        .iter()
++        .map(|(model, _)| *model)
++        .filter(|model| *model != AUTO_MODEL && !CHAT_MODELS.contains(model))
++        .filter(|model| provider_available(model))
++        .collect::<Vec<_>>();
++    let rest = &models[CHAT_MODELS.len() + 1..];
++    assert_eq!(&rest[..routed.len()], routed.as_slice());
++    // Discovered Melious models (MELIOUS_MODELS) follow the routed extras.
++    assert!(rest[routed.len()..].iter().all(|model| model.starts_with("melious/")));
+ }
+ 
+ #[test]

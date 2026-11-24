@@ -16,6 +16,7 @@ Not affiliated with or endorsed by Macro. Upstream does not publish server image
 | Patch | Why |
 |---|---|
 | `0001-local-aws-env-credentials.patch` | In `ENVIRONMENT=local`, upstream `macro_aws_config::local_aws_config` signs every AWS request with the SDK's public test key (`ANOTREAL`). LocalStack accepts any key; an S3 that checks signatures (SeaweedFS) rejects all of them, and accepting the test key would let anyone who reaches the S3 endpoint sign requests, because its secret is published. The patch signs with `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` when they are set, else with the test key as before. |
+| `0002-optional-llm-providers-melious.patch` | Upstream's agent router requires `CEREBRAS_API_KEY` and `FIREWORK_API_KEY` and panics without them, and offers only its static model list. The patch makes Cerebras and Fireworks optional (registered only when their key is set), adds Melious (`MELIOUS_API_KEY`, `MELIOUS_BASE_URL`) as an OpenAI-compatible provider, and reads the Melious models from `MELIOUS_MODELS` (one `<id> <context window> <0\|1 images>` line per model). The model picker offers a provider's models only when its key is set. |
 
 A patch changes the binaries of a tag that already has an image, so the daily build does not pick it up: run the workflow with `tag=<tag>` and `force=services`. That overwrites the tag, so deployments must pin by digest (they do).
 
