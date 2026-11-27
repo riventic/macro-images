@@ -15,7 +15,7 @@ on:
         required: false
         default: ""
       force:
-        description: "Comma list of groups to rebuild even if they exist (services,web,node,init,opensearch), or 'all'."
+        description: "Comma list of groups to rebuild even if they exist (services,web,node,init,opensearch,transcriber), or 'all'."
         required: false
         default: ""
   schedule:
@@ -40,7 +40,7 @@ jobs:
     outputs:
       tag: ${{ steps.r.outputs.tag }}
       sha: ${{ steps.r.outputs.sha }}
-      # JSON array of groups to build: services, web, node, init, opensearch.
+      # JSON array of groups to build: services, web, node, init, opensearch, transcriber.
       todo: ${{ steps.r.outputs.todo }}
     steps:
       - name: Log in to GHCR (read)
@@ -75,9 +75,10 @@ jobs:
             [node]="macro-websocket-service macro-sync-service macro-lexical-service"
             [init]="macro-init"
             [opensearch]="macro-opensearch"
+            [transcriber]="macro-transcriber"
           )
           todo=()
-          for group in services web node init opensearch; do
+          for group in services web node init opensearch transcriber; do
             if [ "$FORCE" = all ] || [[ ",$FORCE," == *",$group,"* ]]; then
               todo+=("$group"); continue
             fi
@@ -192,6 +193,9 @@ jobs:
             slack_import_worker
             static_file_service
             unfurl_service
+            # One-shot task-embedding backfill (patch 0004); task_dedup's default
+            # `backfill` feature builds it.
+            backfill_task_embeddings
           )
           args=(); for b in "${bins[@]}"; do args+=(--bin "$b"); done
           cargo build --release --locked "${args[@]}"
@@ -327,6 +331,76 @@ jobs:
             org.opencontainers.image.version=${{ env.TAG }}
             org.opencontainers.image.revision=${{ env.SHA }}
             org.opencontainers.image.licenses=AGPL-3.0-only
+
+  # ------------------------------------------------------------- transcriber
+  # Upstream's LiveKit call-transcription agent with patches/transcriber/ on top
+  # (on-prem STT). `git apply` runs no upstream code; pip runs inside BuildKit.
+  transcriber-image:
+    needs: resolve
+    if: contains(fromJSON(needs.resolve.outputs.todo), 'transcriber')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+    env:
+      TAG: ${{ needs.resolve.outputs.tag }}
+      SHA: ${{ needs.resolve.outputs.sha }}
+    steps:
+      - name: Check out upstream
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: macro-inc/macro
+          ref: ${{ needs.resolve.outputs.sha }}
+          path: upstream
+          persist-credentials: false
+      - name: Check out this repository (patches)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: images
+          persist-credentials: false
+      - name: Apply patches
+        # From the repository root: inside a subdirectory `git apply` skips every
+        # path outside it without an error. --directory maps the patch paths.
+        working-directory: upstream
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          for p in ../images/patches/transcriber/*.patch; do
+            echo "applying $p"
+            git apply --check --directory=services/transcription "$p"
+            git apply --directory=services/transcription "$p"
+          done
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Build (load for smoke test)
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: upstream/services/transcription
+          load: true
+          tags: macro-transcriber:test
+      - name: Smoke test — the agent and the on-prem STT import
+        run: docker run --rm -e SPEECH_SERVICE_URL=http://speech.invalid:8140 macro-transcriber:test python -c "import transcriber, onprem_stt"
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Push
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: upstream/services/transcription
+          push: true
+          provenance: mode=max
+          sbom: true
+          tags: ${{ env.REGISTRY }}/macro-transcriber:${{ env.TAG }}
+          labels: |
+            org.opencontainers.image.title=macro-transcriber (unofficial)
+            org.opencontainers.image.source=https://github.com/riventic/macro-images
+            org.opencontainers.image.url=https://github.com/macro-inc/macro/tree/${{ env.TAG }}
+            org.opencontainers.image.version=${{ env.TAG }}
+            org.opencontainers.image.revision=${{ env.SHA }}
+            org.opencontainers.image.licenses=AGPL-3.0-only
+            ai.riventic.macro-images.revision=${{ github.sha }}
 
   # --------------------------------------------------------------------- web
   web-build:

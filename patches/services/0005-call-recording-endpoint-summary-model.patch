@@ -1,0 +1,267 @@
+diff --git a/crates/agent/src/completion.rs b/crates/agent/src/completion.rs
+index 61eaae4ab..43c0e3e34 100644
+--- a/crates/agent/src/completion.rs
++++ b/crates/agent/src/completion.rs
+@@ -19,6 +19,13 @@ use rig_core::message::Message;
+ 
+ const ONE_SHOT_MAX_TOKENS: u64 = 16_000;
+ 
++/// Whether `model` routes to a provider this deployment registers. [`complete`]
++/// falls back to the default model for an id that does not route, so a caller
++/// that takes a model id from configuration checks it with this at startup.
++pub fn is_routable(model: &str) -> anyhow::Result<bool> {
++    Ok(ModelRouter::shared()?.route(model).is_ok())
++}
++
+ /// Send a system prompt + user message and return the model's text response.
+ ///
+ /// This is the simple, non-streaming path for one-shot tasks like
+diff --git a/crates/agent/src/lib.rs b/crates/agent/src/lib.rs
+index 7ae48dc75..9eddee892 100644
+--- a/crates/agent/src/lib.rs
++++ b/crates/agent/src/lib.rs
+@@ -26,6 +26,7 @@ pub use accumulator::StreamAccumulator;
+ pub use agent_loop::{AgentLoop, Session};
+ pub use completion::{
+     complete, complete_about_image, complete_with_history, complete_with_history_and_params,
++    is_routable,
+ };
+ pub use convert::{merge_consecutive_parts, to_rig_messages, to_rig_messages_limited};
+ pub use error::AgentError;
+diff --git a/crates/call/src/domain/models.rs b/crates/call/src/domain/models.rs
+index 14135093a..73bd3c2da 100644
+--- a/crates/call/src/domain/models.rs
++++ b/crates/call/src/domain/models.rs
+@@ -414,6 +414,8 @@ pub struct EgressS3Config {
+     pub access_key: String,
+     /// AWS secret access key.
+     pub secret: String,
++    /// S3-compatible endpoint the egress uploads to, path-style. `None` is AWS S3.
++    pub endpoint: Option<String>,
+ }
+ 
+ impl fmt::Debug for EgressS3Config {
+@@ -423,6 +425,7 @@ impl fmt::Debug for EgressS3Config {
+             .field("region", &self.region)
+             .field("access_key", &"<redacted>")
+             .field("secret", &"<redacted>")
++            .field("endpoint", &self.endpoint)
+             .finish()
+     }
+ }
+diff --git a/crates/call/src/domain/service/test.rs b/crates/call/src/domain/service/test.rs
+index cb4a97ae2..258f3546a 100644
+--- a/crates/call/src/domain/service/test.rs
++++ b/crates/call/src/domain/service/test.rs
+@@ -617,6 +617,7 @@ fn build_get_or_create_service<B: MacroEventBroker + Clone, Cn: ConnectionServic
+             region: "us-east-1".to_string(),
+             access_key: "access-key".to_string(),
+             secret: "secret".to_string(),
++            endpoint: None,
+         })
+     } else {
+         service
+diff --git a/crates/call/src/domain/service/test/channel_startup.rs b/crates/call/src/domain/service/test/channel_startup.rs
+index 835c26cb4..ce9fd9f1a 100644
+--- a/crates/call/src/domain/service/test/channel_startup.rs
++++ b/crates/call/src/domain/service/test/channel_startup.rs
+@@ -152,6 +152,7 @@ async fn channel_token_does_not_wait_for_media_or_recipient_notifications() {
+         region: "test".into(),
+         access_key: "test".into(),
+         secret: "test".into(),
++        endpoint: None,
+     });
+     configure_repository_clone(&service.repo, background_repo);
+     let token = tokio::time::timeout(
+diff --git a/crates/call/src/domain/service/test/meeting_startup.rs b/crates/call/src/domain/service/test/meeting_startup.rs
+index a72234f67..e0293f58b 100644
+--- a/crates/call/src/domain/service/test/meeting_startup.rs
++++ b/crates/call/src/domain/service/test/meeting_startup.rs
+@@ -357,6 +357,7 @@ fn test_egress_config() -> EgressS3Config {
+         region: "test".into(),
+         access_key: "test".into(),
+         secret: "test".into(),
++        endpoint: None,
+     }
+ }
+ 
+diff --git a/crates/call/src/outbound/ai_call_summarizer.rs b/crates/call/src/outbound/ai_call_summarizer.rs
+index 36777a753..7c70d0311 100644
+--- a/crates/call/src/outbound/ai_call_summarizer.rs
++++ b/crates/call/src/outbound/ai_call_summarizer.rs
+@@ -122,12 +122,31 @@ const CALL_NAME_MAX_CHARS: usize = 80;
+ #[derive(Clone)]
+ pub struct AiCallSummarizer {
+     recorder: std::sync::Arc<dyn ai_usage::UsageRecorder>,
++    /// Routing id of the model for the summary, the call name and the speakers.
++    model: String,
+ }
+ 
+ impl AiCallSummarizer {
+-    /// Create a new [`AiCallSummarizer`] that records usage via `recorder`.
++    /// Create a new [`AiCallSummarizer`] on [`SUMMARIZATION_MODEL`] that records usage via `recorder`.
+     pub fn new(recorder: std::sync::Arc<dyn ai_usage::UsageRecorder>) -> Self {
+-        Self { recorder }
++        Self {
++            recorder,
++            model: SUMMARIZATION_MODEL.to_string(),
++        }
++    }
++
++    /// Create a new [`AiCallSummarizer`] on `model`, a routing id such as `melious/<id>`.
++    /// Fails when `model` routes to no registered provider: a completion on such an id
++    /// falls back to the default model without an error.
++    pub fn with_model(
++        recorder: std::sync::Arc<dyn ai_usage::UsageRecorder>,
++        model: String,
++    ) -> anyhow::Result<Self> {
++        anyhow::ensure!(
++            agent::is_routable(&model)?,
++            "call summary model {model} routes to no registered provider"
++        );
++        Ok(Self { recorder, model })
+     }
+ }
+ 
+@@ -143,7 +162,7 @@ impl CallSummarizer for AiCallSummarizer {
+         let user_message = format_transcript_prompt(call_id, &transcript);
+ 
+         let raw = agent::complete(
+-            SUMMARIZATION_MODEL,
++            &self.model,
+             SUMMARIZATION_SYSTEM_PROMPT,
+             &user_message,
+             self.recorder.as_ref(),
+@@ -181,7 +200,7 @@ impl CallSummarizer for AiCallSummarizer {
+         let user_message = format!("Summary:\n\n{summary_for_prompt}");
+ 
+         let raw = agent::complete(
+-            SUMMARIZATION_MODEL,
++            &self.model,
+             CALL_NAME_SYSTEM_PROMPT,
+             &user_message,
+             self.recorder.as_ref(),
+@@ -217,7 +236,7 @@ impl CallSummarizer for AiCallSummarizer {
+         let user_message = format_custom_speakers_prompt(&transcript, &candidate_speakers);
+ 
+         let raw = agent::complete(
+-            SUMMARIZATION_MODEL,
++            &self.model,
+             CUSTOM_SPEAKER_SYSTEM_PROMPT,
+             &user_message,
+             self.recorder.as_ref(),
+diff --git a/crates/call/src/outbound/livekit_rtc_client.rs b/crates/call/src/outbound/livekit_rtc_client.rs
+index 12cf8f6e3..877cf0703 100644
+--- a/crates/call/src/outbound/livekit_rtc_client.rs
++++ b/crates/call/src/outbound/livekit_rtc_client.rs
+@@ -104,6 +104,10 @@ fn build_room_composite_egress_request(
+             region: s3_config.region.clone(),
+             access_key: s3_config.access_key.clone(),
+             secret: s3_config.secret.clone(),
++            // The request replaces the egress config file s3 block, so a non-AWS store
++            // must be named here. SeaweedFS serves a bucket as a path segment only.
++            endpoint: s3_config.endpoint.clone().unwrap_or_default(),
++            force_path_style: s3_config.endpoint.is_some(),
+             ..Default::default()
+         })),
+         ..Default::default()
+diff --git a/crates/call/src/outbound/livekit_rtc_client/test.rs b/crates/call/src/outbound/livekit_rtc_client/test.rs
+index 882decb4b..9581be374 100644
+--- a/crates/call/src/outbound/livekit_rtc_client/test.rs
++++ b/crates/call/src/outbound/livekit_rtc_client/test.rs
+@@ -69,12 +69,42 @@ fn room_composite_egress_uses_speaker_layout() {
+             region: "us-east-1".to_owned(),
+             access_key: "test-access-key".to_owned(),
+             secret: "test-secret".to_owned(),
++            endpoint: None,
+         },
+     );
+ 
+     assert_eq!(request.options.layout, "speaker");
+ }
+ 
++#[test]
++fn room_composite_egress_names_a_custom_endpoint_path_style() {
++    let config = |endpoint: Option<&str>| EgressS3Config {
++        bucket: "test-bucket".to_owned(),
++        region: "us-east-1".to_owned(),
++        access_key: "test-access-key".to_owned(),
++        secret: "test-secret".to_owned(),
++        endpoint: endpoint.map(str::to_owned),
++    };
++    let upload = |endpoint: Option<&str>| {
++        let request = build_room_composite_egress_request("room-1", &config(endpoint));
++        match request.outputs.into_iter().next() {
++            Some(EgressOutput::File(EncodedFileOutput {
++                output: Some(encoded_file_output::Output::S3(upload)),
++                ..
++            })) => upload,
++            _ => panic!("expected one S3 file output"),
++        }
++    };
++
++    let custom = upload(Some("http://store:8333"));
++    assert_eq!(custom.endpoint, "http://store:8333");
++    assert!(custom.force_path_style);
++
++    let aws = upload(None);
++    assert_eq!(aws.endpoint, "");
++    assert!(!aws.force_path_style);
++}
++
+ #[tokio::test]
+ async fn verify_access_token_round_trips_identity_and_room() {
+     let client = client();
+diff --git a/services/document_storage_service/src/config.rs b/services/document_storage_service/src/config.rs
+index 24adf0668..61c78f0d7 100644
+--- a/services/document_storage_service/src/config.rs
++++ b/services/document_storage_service/src/config.rs
+@@ -83,6 +83,12 @@ maybe_env_vars! {
+     /// used to build the ring-status URL included in VoIP push payloads.
+     /// When unset, payloads omit the URL and native ring-status polling is off.
+     pub struct CallRingStatusBaseUrl;
++    /// Optional routing id of the model for call summaries (e.g. `melious/<id>`).
++    /// Unset is upstream's default model.
++    pub struct CallSummaryModel;
++    /// Optional S3-compatible endpoint the egress uploads recordings to, path-style.
++    /// Unset is AWS S3.
++    pub struct CallRecordingS3Endpoint;
+     /// S3 bucket for call recording egress.
+     pub struct CallRecordingS3Bucket;
+     /// AWS region for the call recording S3 bucket.
+diff --git a/services/document_storage_service/src/server.rs b/services/document_storage_service/src/server.rs
+index 3f17a62ae..dce3a7cd0 100644
+--- a/services/document_storage_service/src/server.rs
++++ b/services/document_storage_service/src/server.rs
+@@ -884,6 +884,9 @@ async fn run_server() -> anyhow::Result<()> {
+                 region: region.as_ref().to_string(),
+                 access_key: access_key.as_ref().to_string(),
+                 secret: secret.as_ref().to_string(),
++                endpoint: config::CallRecordingS3Endpoint::new()
++                    .map(|endpoint| endpoint.as_ref().to_string())
++                    .filter(|endpoint| !endpoint.is_empty()),
+             })
+         }
+         _ => None,
+@@ -918,9 +921,18 @@ async fn run_server() -> anyhow::Result<()> {
+         recording_storage,
+         config.livekit_server_url.as_ref(),
+     )
+-    .with_summarizer(AiCallSummarizer::new(
+-        ai_usage::pg_recorder_with_enforcement(db.clone(), config.enable_ai_usage_enforcement),
+-    ));
++    .with_summarizer({
++        let recorder =
++            ai_usage::pg_recorder_with_enforcement(db.clone(), config.enable_ai_usage_enforcement);
++        // Unset or empty: upstream's model, and the router is built lazily as upstream does.
++        match config::CallSummaryModel::new()
++            .map(|model| model.as_ref().to_string())
++            .filter(|model| !model.is_empty())
++        {
++            Some(model) => AiCallSummarizer::with_model(recorder, model)?,
++            None => AiCallSummarizer::new(recorder),
++        }
++    });
+     if let Some(secret) = internal_call_secret {
+         call_service_builder = call_service_builder.with_internal_call_secret(secret);
+     }
