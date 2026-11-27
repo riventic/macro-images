@@ -1,0 +1,427 @@
+diff --git a/onprem_stt.py b/onprem_stt.py
+new file mode 100644
+index 000000000..409ad048f
+--- /dev/null
++++ b/onprem_stt.py
+@@ -0,0 +1,204 @@
++"""On-prem speech-to-text: VAD-cut utterances sent to a faster-whisper sidecar.
++
++Replaces the LiveKit Cloud `inference.STT` (Deepgram), so call audio never leaves
++the host. Silero VAD cuts each participant's stream into utterances; each
++utterance goes as one WAV to the sidecar's `POST /transcribe`, which answers
++`{text, language, duration_ms, model}` and detects the language itself.
++
++Whisper returns no word timing. Each FINAL therefore carries ONE timed word that
++spans the utterance, with stream-relative offsets taken from the VAD. That is the
++shape `Transcriber.stt_node` reads to place a segment on the call timeline.
++"""
++
++import asyncio
++import logging
++
++import httpx
++from livekit import rtc
++from livekit.agents import (
++    DEFAULT_API_CONNECT_OPTIONS,
++    APIConnectionError,
++    APIConnectOptions,
++    APIError,
++    APIStatusError,
++    APITimeoutError,
++    stt,
++    utils,
++    vad as vad_pkg,
++)
++from livekit.agents.types import NOT_GIVEN, NotGivenOr, TimedString
++
++logger = logging.getLogger("macro-transcriber.onprem-stt")
++
++# The sidecar refuses audio over 60 s (HTTP 413); Silero buffers up to 60 s plus padding.
++MAX_UTTERANCE_SECONDS = 59.0
++# Shorter VAD segments are mostly noise bursts, on which Whisper invents text.
++MIN_SPEECH_SECONDS = 0.25
++
++
++class SpeechSidecarSTT(stt.STT):
++    """Streaming STT from a VAD plus the sidecar's one-shot `POST /transcribe`."""
++
++    def __init__(
++        self,
++        *,
++        base_url: str,
++        vad: vad_pkg.VAD,
++        http_client: httpx.AsyncClient,
++        timeout_seconds: float,
++    ):
++        super().__init__(
++            capabilities=stt.STTCapabilities(streaming=True, interim_results=False)
++        )
++        self._url = f"{base_url.rstrip('/')}/transcribe"
++        self._vad = vad
++        self._http_client = http_client
++        # Seconds of CPU, not of I/O: the sidecar runs one utterance at a time, so an
++        # utterance can wait behind every other speaker in the call.
++        self._timeout_seconds = timeout_seconds
++
++    @property
++    def model(self) -> str:
++        return "faster-whisper"
++
++    @property
++    def provider(self) -> str:
++        return "speech-sidecar"
++
++    async def _recognize_impl(
++        self,
++        buffer: utils.AudioBuffer,
++        *,
++        language: NotGivenOr[str] = NOT_GIVEN,
++        conn_options: APIConnectOptions,
++    ) -> stt.SpeechEvent:
++        frame = utils.merge_frames(buffer)
++        if frame.duration > MAX_UTTERANCE_SECONDS:
++            logger.warning(
++                "utterance of %.1fs cut to %.0fs for the speech sidecar",
++                frame.duration,
++                MAX_UTTERANCE_SECONDS,
++            )
++            keep = int(MAX_UTTERANCE_SECONDS * frame.sample_rate) * frame.num_channels
++            frame = rtc.AudioFrame(
++                data=frame.data[:keep].tobytes(),
++                sample_rate=frame.sample_rate,
++                num_channels=frame.num_channels,
++                samples_per_channel=keep // frame.num_channels,
++            )
++        wav = frame.to_wav_bytes()
++        try:
++            resp = await self._http_client.post(
++                self._url,
++                files={"audio": ("utterance.wav", wav, "audio/wav")},
++                timeout=self._timeout_seconds,
++            )
++        except httpx.TimeoutException as exc:
++            raise APITimeoutError() from exc
++        except httpx.HTTPError as exc:
++            raise APIConnectionError(str(exc)) from exc
++        if resp.is_error:
++            raise APIStatusError(
++                "speech sidecar refused the utterance",
++                status_code=resp.status_code,
++                body=resp.text,
++            )
++        try:
++            body = resp.json()
++            text, language = body["text"], body["language"]
++        except (ValueError, TypeError, KeyError) as exc:
++            raise APIStatusError(
++                "speech sidecar sent no transcript", status_code=resp.status_code, body=resp.text
++            ) from exc
++        if not isinstance(text, str) or not isinstance(language, str):
++            raise APIStatusError(
++                "speech sidecar sent no transcript", status_code=resp.status_code, body=resp.text
++            )
++        return stt.SpeechEvent(
++            type=stt.SpeechEventType.FINAL_TRANSCRIPT,
++            alternatives=[stt.SpeechData(language=language, text=text.strip())],
++        )
++
++    def stream(
++        self,
++        *,
++        language: NotGivenOr[str] = NOT_GIVEN,
++        conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS,
++    ) -> stt.RecognizeStream:
++        return _UtteranceStream(self, vad=self._vad, conn_options=conn_options)
++
++
++class _UtteranceStream(stt.RecognizeStream):
++    """`stt.StreamAdapter`'s loop, plus VAD timing on each FINAL.
++
++    A failed utterance is logged and skipped. The stream stays up, so one
++    refused utterance does not end the participant's transcription. That is why
++    `_transcribe` calls `_recognize_impl` and not `STT.recognize`: after its last
++    retry, `recognize` emits an unrecoverable `error`, and AgentSession closes on it.
++    No retry either: the sidecar keeps decoding a timed-out request, so a retry only
++    queues the same audio again behind it.
++    """
++
++    def __init__(self, sidecar: SpeechSidecarSTT, *, vad: vad_pkg.VAD, conn_options: APIConnectOptions):
++        super().__init__(
++            stt=sidecar, conn_options=APIConnectOptions(max_retry=0, timeout=conn_options.timeout)
++        )
++        self._sidecar = sidecar
++        self._vad = vad
++
++    async def _run(self) -> None:
++        vad_stream = self._vad.stream()
++
++        async def _forward_input() -> None:
++            async for frame in self._input_ch:
++                if isinstance(frame, self._FlushSentinel):
++                    vad_stream.flush()
++                    continue
++                vad_stream.push_frame(frame)
++            vad_stream.end_input()
++
++        async def _recognize() -> None:
++            async for event in vad_stream:
++                match event.type:
++                    case vad_pkg.VADEventType.START_OF_SPEECH:
++                        self._event_ch.send_nowait(
++                            stt.SpeechEvent(type=stt.SpeechEventType.START_OF_SPEECH)
++                        )
++                    case vad_pkg.VADEventType.END_OF_SPEECH:
++                        self._event_ch.send_nowait(
++                            stt.SpeechEvent(type=stt.SpeechEventType.END_OF_SPEECH)
++                        )
++                        await self._transcribe(event)
++
++        tasks = [
++            asyncio.create_task(_forward_input(), name="forward_input"),
++            asyncio.create_task(_recognize(), name="recognize"),
++        ]
++        try:
++            await asyncio.gather(*tasks)
++        finally:
++            await utils.aio.cancel_and_wait(*tasks)
++            await vad_stream.aclose()
++
++    async def _transcribe(self, event: vad_pkg.VADEvent) -> None:
++        # END_OF_SPEECH fires after `silence_duration` of silence; the speech ended before it.
++        ended = max(0.0, event.timestamp - event.silence_duration)
++        started = max(0.0, ended - event.speech_duration)
++        if event.speech_duration < MIN_SPEECH_SECONDS:
++            return
++        try:
++            result = await self._sidecar._recognize_impl(
++                event.frames, conn_options=self._conn_options
++            )
++        except APIError:
++            logger.exception("utterance not transcribed, start=%.2fs end=%.2fs", started, ended)
++            return
++        alt = result.alternatives[0] if result.alternatives else None
++        if alt is None or not alt.text:
++            return
++        alt.start_time = started
++        alt.end_time = ended
++        alt.words = [TimedString(alt.text, start_time=started, end_time=ended)]
++        self._event_ch.send_nowait(
++            stt.SpeechEvent(type=stt.SpeechEventType.FINAL_TRANSCRIPT, alternatives=[alt])
++        )
+diff --git a/requirements.txt b/requirements.txt
+index d98ef6ba3..d9243f867 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -1,5 +1,5 @@
+-python-dotenv
++python-dotenv==1.2.4
+ livekit-agents[silero]==1.5.7
+-httpx
++httpx==0.28.1
+ resemblyzer==0.1.4
+ setuptools==80.10.2  # resemblyzer's webrtcvad dependency imports pkg_resources
+diff --git a/test_transcriber.py b/test_transcriber.py
+index 60a775e28..fea64bc25 100644
+--- a/test_transcriber.py
++++ b/test_transcriber.py
+@@ -1,15 +1,23 @@
++import asyncio
++import os
+ import unittest
+-from unittest.mock import patch, sentinel
++from types import SimpleNamespace
++from unittest.mock import AsyncMock, patch, sentinel
+ 
+-import transcriber
++# The image build imports transcriber.py without SPEECH_SERVICE_URL (`download-files`).
++os.environ.pop("SPEECH_SERVICE_URL", None)
++
++import onprem_stt  # noqa: E402
++import transcriber  # noqa: E402
++from livekit.agents import APIStatusError, stt  # noqa: E402
+ 
+ 
+ class TranscriberConfigurationTest(unittest.TestCase):
+-    def test_configures_multilingual_deepgram_transcription(self):
++    def test_configures_on_prem_sidecar_transcription(self):
+         with (
+             patch.object(
+-                transcriber.inference,
+-                "STT",
++                transcriber,
++                "SpeechSidecarSTT",
+                 return_value=sentinel.stt,
+             ) as create_stt,
+             patch.object(transcriber.Agent, "__init__", return_value=None) as init_agent,
+@@ -18,19 +26,82 @@ class TranscriberConfigurationTest(unittest.TestCase):
+                 participant_identity="participant-id",
+                 channel_id="channel-id",
+                 http_client=sentinel.http_client,
++                vad=sentinel.vad,
++                speech_service_url="http://speech.test:8140",
+             )
+ 
+-        create_stt.assert_called_once()
+-        args, kwargs = create_stt.call_args
+-        self.assertEqual(args, ("deepgram/nova-3",))
+-        self.assertEqual(kwargs["language"], "multi")
+-        self.assertTrue(kwargs["extra_kwargs"]["diarize"])
+-        self.assertNotIn("detect_language", kwargs["extra_kwargs"])
++        create_stt.assert_called_once_with(
++            base_url="http://speech.test:8140",
++            vad=sentinel.vad,
++            http_client=sentinel.http_client,
++            timeout_seconds=transcriber.SPEECH_TIMEOUT_SECONDS,
++        )
+         init_agent.assert_called_once_with(
+             instructions="Transcribe user speech.",
+             stt=sentinel.stt,
+         )
+ 
+ 
++def _stream(sidecar, sent):
++    return SimpleNamespace(
++        _sidecar=sidecar,
++        _conn_options=sentinel.options,
++        _event_ch=SimpleNamespace(send_nowait=sent.append),
++    )
++
++
++class UtteranceTimingTest(unittest.TestCase):
++    def test_final_carries_one_word_spanning_the_vad_utterance(self):
++        sidecar = SimpleNamespace(
++            _recognize_impl=AsyncMock(
++                return_value=stt.SpeechEvent(
++                    type=stt.SpeechEventType.FINAL_TRANSCRIPT,
++                    alternatives=[stt.SpeechData(language="de", text="Guten Morgen")],
++                )
++            )
++        )
++        sent: list[stt.SpeechEvent] = []
++        stream = _stream(sidecar, sent)
++        event = SimpleNamespace(
++            timestamp=12.0, silence_duration=0.5, speech_duration=3.0, frames=sentinel.frames
++        )
++
++        asyncio.run(onprem_stt._UtteranceStream._transcribe(stream, event))
++
++        sidecar._recognize_impl.assert_awaited_once_with(
++            sentinel.frames, conn_options=sentinel.options
++        )
++        [final] = sent
++        [word] = final.alternatives[0].words
++        self.assertEqual(final.type, stt.SpeechEventType.FINAL_TRANSCRIPT)
++        self.assertEqual(word, "Guten Morgen")
++        self.assertEqual((word.start_time, word.end_time), (8.5, 11.5))
++
++    def test_refused_utterance_is_skipped_without_closing_the_stream(self):
++        sidecar = SimpleNamespace(
++            _recognize_impl=AsyncMock(
++                side_effect=APIStatusError("refused", status_code=413, body="")
++            )
++        )
++        sent: list[stt.SpeechEvent] = []
++        event = SimpleNamespace(
++            timestamp=12.0, silence_duration=0.5, speech_duration=3.0, frames=sentinel.frames
++        )
++
++        asyncio.run(onprem_stt._UtteranceStream._transcribe(_stream(sidecar, sent), event))
++
++        self.assertEqual(sent, [])
++
++    def test_noise_burst_is_not_sent(self):
++        sidecar = SimpleNamespace(_recognize_impl=AsyncMock())
++        event = SimpleNamespace(
++            timestamp=2.0, silence_duration=0.55, speech_duration=0.1, frames=sentinel.frames
++        )
++
++        asyncio.run(onprem_stt._UtteranceStream._transcribe(_stream(sidecar, []), event))
++
++        sidecar._recognize_impl.assert_not_awaited()
++
++
+ if __name__ == "__main__":
+     unittest.main()
+diff --git a/transcriber.py b/transcriber.py
+index 5e7a86230..c94ede95a 100644
+--- a/transcriber.py
++++ b/transcriber.py
+@@ -20,7 +20,6 @@ from livekit.agents import (
+     JobProcess,
+     StopResponse,
+     cli,
+-    inference,
+     llm,
+     room_io,
+     stt as stt_pkg,
+@@ -29,6 +28,8 @@ from livekit.agents import (
+ )
+ from livekit.plugins import silero
+ 
++from onprem_stt import SpeechSidecarSTT
++
+ # `resemblyzer` imports `webrtcvad`, which currently emits a noisy setuptools
+ # `pkg_resources` deprecation warning once per worker process. It is not
+ # actionable for the agent, so keep production logs focused on runtime issues.
+@@ -46,6 +47,7 @@ logger = logging.getLogger("macro-transcriber")
+ 
+ MACRO_API_URL = os.environ.get("MACRO_API_URL", "http://localhost:8080")
+ INTERNAL_CALL_SECRET = os.environ.get("INTERNAL_CALL_SECRET", "")
++SPEECH_TIMEOUT_SECONDS = 60.0
+ 
+ # Cosine distance threshold for in-call Resemblyzer speaker clustering.
+ # Lower = stricter / more new diarized ids; higher = looser / more reuse.
+@@ -155,27 +157,17 @@ class Transcriber(Agent):
+         participant_identity: str,
+         channel_id: str,
+         http_client: httpx.AsyncClient,
++        vad: silero.VAD,
++        speech_service_url: str,
+         voice_encoder: VoiceEncoder | None = None,
+     ):
+         super().__init__(
+             instructions="Transcribe user speech.",
+-            stt=inference.STT(
+-                "deepgram/nova-3",
+-                language="multi",
+-                extra_kwargs={
+-                    # ms of silence before Deepgram finalizes an utterance.
+-                    # Library default is 25ms, which cuts hesitant speakers mid-thought.
+-                    "endpointing": 400,
+-                    "smart_format": False,
+-                    "punctuate": True,
+-                    "filler_words": True,
+-                    "numerals": True,
+-                    "interim_results": True,
+-                    "no_delay": True,
+-                    # Keep provider speaker labels as a fallback for very short
+-                    # turns where Resemblyzer cannot produce a stable embedding.
+-                    "diarize": True,
+-                },
++            stt=SpeechSidecarSTT(
++                base_url=speech_service_url,
++                vad=vad,
++                http_client=http_client,
++                timeout_seconds=SPEECH_TIMEOUT_SECONDS,
+             ),
+         )
+         self.participant_identity = participant_identity
+@@ -559,6 +551,8 @@ class MultiUserTranscriber:
+                 participant_identity=participant.identity,
+                 channel_id=self.ctx.room.name,
+                 http_client=self.http_client,
++                vad=self.ctx.proc.userdata["vad"],
++                speech_service_url=self.ctx.proc.userdata["speech_service_url"],
+                 voice_encoder=self.ctx.proc.userdata.get("voice_encoder"),
+             ),
+             room=self.ctx.room,
+@@ -595,6 +589,9 @@ async def entrypoint(ctx: JobContext):
+ 
+ 
+ def prewarm(proc: JobProcess):
++    # On-prem STT sidecar (faster-whisper). Required: no cloud STT stands in for it.
++    # Read here, not at import: the image build imports this file (`download-files`).
++    proc.userdata["speech_service_url"] = os.environ["SPEECH_SERVICE_URL"]
+     proc.userdata["vad"] = silero.VAD.load()
+     # Load the Resemblyzer encoder once per worker process so per-turn
+     # embedding doesn't pay the model-load cost on the hot path.

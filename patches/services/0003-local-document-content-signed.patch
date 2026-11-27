@@ -1,0 +1,356 @@
+diff --git a/crates/documents/src/domain/ports.rs b/crates/documents/src/domain/ports.rs
+index a662ca2cb..7b3cf110b 100644
+--- a/crates/documents/src/domain/ports.rs
++++ b/crates/documents/src/domain/ports.rs
+@@ -389,6 +389,14 @@ pub trait PresignedUploadUrlPort: Send + Sync + 'static {
+     /// Remove a destination object when a multi-part document copy fails.
+     fn delete_object(&self, key: &str) -> impl Future<Output = anyhow::Result<()>> + Send;
+ 
++    /// Browser-facing presigned GET for an object in the document storage bucket.
++    /// Local mode serves document content with it in place of a CloudFront URL.
++    fn get_document_storage_presigned_url(
++        &self,
++        key: &str,
++        expiry_seconds: u64,
++    ) -> impl Future<Output = anyhow::Result<String>> + Send;
++
+     /// Returns the raw bytes of the cached Loro snapshot, or `None` if no snapshot exists.
+     fn get_snapshot(
+         &self,
+diff --git a/crates/documents/src/domain/service.rs b/crates/documents/src/domain/service.rs
+index 22a733b54..e3c7ea2a7 100644
+--- a/crates/documents/src/domain/service.rs
++++ b/crates/documents/src/domain/service.rs
+@@ -438,17 +438,24 @@ impl<
+         )
+     }
+ 
+-    fn make_presigned_url(&self, key: &str) -> anyhow::Result<String> {
++    /// Signed URL for an object in the document storage bucket. Local mode has no
++    /// CloudFront: an S3-presigned GET there, because an S3 with access checks
++    /// (SeaweedFS) refuses the bare distribution URL.
++    async fn make_presigned_url(&self, key: &str) -> anyhow::Result<String> {
++        if macro_aws_config::is_local_aws() {
++            return self
++                .upload_url_service
++                .get_document_storage_presigned_url(
++                    key,
++                    self.cloudfront_config.presigned_url_expiry_seconds,
++                )
++                .await;
++        }
+         let constructed_url = self.cloudfront_url_for_key(key);
+-        let options = self.get_signed_options();
+-
+-        let signed_url = if !macro_aws_config::is_local_aws() {
+-            get_signed_url(&constructed_url, &options)?
+-        } else {
+-            constructed_url
+-        };
+-
+-        Ok(signed_url)
++        Ok(get_signed_url(
++            &constructed_url,
++            &self.get_signed_options(),
++        )?)
+     }
+ 
+     async fn get_editable_url(
+@@ -471,7 +478,7 @@ impl<
+         let document_key =
+             build_cloud_storage_bucket_document_key(owner, document_id, document_version_id);
+ 
+-        let signed_url = self.make_presigned_url(&document_key)?;
++        let signed_url = self.make_presigned_url(&document_key).await?;
+         Ok(LocationResponseData::PresignedUrl(signed_url))
+     }
+ 
+@@ -490,7 +497,7 @@ impl<
+         let document_key =
+             build_cloud_storage_bucket_document_key(owner, document_id, document_version_id);
+ 
+-        let signed_url = self.make_presigned_url(&document_key)?;
++        let signed_url = self.make_presigned_url(&document_key).await?;
+         Ok(LocationResponseData::PresignedUrl(signed_url))
+     }
+ 
+@@ -501,7 +508,7 @@ impl<
+     ) -> anyhow::Result<LocationResponseData> {
+         let document_key = build_docx_to_pdf_converted_document_key(owner, document_id);
+ 
+-        let signed_url = self.make_presigned_url(&document_key)?;
++        let signed_url = self.make_presigned_url(&document_key).await?;
+         Ok(LocationResponseData::PresignedUrl(signed_url))
+     }
+ 
+@@ -522,6 +529,17 @@ impl<
+                 .map_err(Into::into)?
+         };
+ 
++        if macro_aws_config::is_local_aws() {
++            let mut presigned_urls = Vec::with_capacity(shas.len());
++            for sha in &shas {
++                presigned_urls.push(PresignedUrl {
++                    presigned_url: self.make_presigned_url(sha).await?,
++                    sha: sha.to_string(),
++                });
++            }
++            return Ok(LocationResponseData::PresignedUrls(presigned_urls));
++        }
++
+         let options = self.get_signed_options();
+         let distribution_url = &self.cloudfront_config.distribution_url;
+ 
+diff --git a/crates/documents/src/domain/service/tests.rs b/crates/documents/src/domain/service/tests.rs
+index dc2f79d93..1c50a617b 100644
+--- a/crates/documents/src/domain/service/tests.rs
++++ b/crates/documents/src/domain/service/tests.rs
+@@ -121,6 +121,13 @@ impl PresignedUploadUrlPort for TestUploadUrlPort {
+     async fn delete_object(&self, _key: &str) -> anyhow::Result<()> {
+         Ok(())
+     }
++    async fn get_document_storage_presigned_url(
++        &self,
++        _key: &str,
++        _expiry_seconds: u64,
++    ) -> anyhow::Result<String> {
++        Ok(String::new())
++    }
+     async fn put_document_storage_presigned_url(
+         &self,
+         _key: &str,
+@@ -2200,6 +2207,13 @@ struct RecordingUploadUrlPort {
+ }
+ 
+ impl PresignedUploadUrlPort for RecordingUploadUrlPort {
++    async fn get_document_storage_presigned_url(
++        &self,
++        _key: &str,
++        _expiry_seconds: u64,
++    ) -> anyhow::Result<String> {
++        Ok(String::new())
++    }
+     async fn delete_object(&self, key: &str) -> anyhow::Result<()> {
+         self.deletions.lock().unwrap().push(key.to_string());
+         if self.fail_delete {
+diff --git a/crates/documents/src/outbound/s3_upload_url.rs b/crates/documents/src/outbound/s3_upload_url.rs
+index 03174816e..f185fa194 100644
+--- a/crates/documents/src/outbound/s3_upload_url.rs
++++ b/crates/documents/src/outbound/s3_upload_url.rs
+@@ -51,6 +51,24 @@ impl PresignedUploadUrlPort for S3UploadUrlAdapter {
+         Ok(())
+     }
+ 
++    #[tracing::instrument(skip(self), err)]
++    async fn get_document_storage_presigned_url(
++        &self,
++        key: &str,
++        expiry_seconds: u64,
++    ) -> anyhow::Result<String> {
++        let presigned = self
++            .client
++            .get_object()
++            .bucket(&self.document_storage_bucket)
++            .key(key)
++            .presigned(PresigningConfig::expires_in(Duration::from_secs(
++                expiry_seconds,
++            ))?)
++            .await?;
++        Ok(macro_aws_config::transform_aws_url(presigned.uri()))
++    }
++
+     #[tracing::instrument(skip(self), err)]
+     async fn put_document_storage_presigned_url(
+         &self,
+diff --git a/services/document_storage_service/src/api/documents/location.rs b/services/document_storage_service/src/api/documents/location.rs
+index a597ef3ab..b2a177c89 100644
+--- a/services/document_storage_service/src/api/documents/location.rs
++++ b/services/document_storage_service/src/api/documents/location.rs
+@@ -7,7 +7,9 @@ use rayon::prelude::*;
+ use std::str::FromStr;
+ 
+ use crate::model::request::documents::location::LocationQueryParams;
+-use crate::service::cloudfront::{get_cloudfront_signed_options, get_presigned_url};
++use crate::service::cloudfront::{
++    document_object_url, get_cloudfront_signed_options, get_presigned_url,
++};
+ use axum::{
+     Extension,
+     body::Body,
+@@ -20,10 +22,7 @@ use model::{
+     response::{GenericErrorResponse, GenericResponse, PresignedUrl},
+ };
+ use model_owner::Owner;
+-use s3_key::{
+-    build_cloud_storage_bucket_document_key, build_docx_to_pdf_converted_document_key,
+-    document_key_url_path,
+-};
++use s3_key::{build_cloud_storage_bucket_document_key, build_docx_to_pdf_converted_document_key};
+ 
+ #[derive(serde::Deserialize)]
+ pub struct Params {
+@@ -128,26 +127,7 @@ async fn sign_document_key(
+         }
+     }
+ 
+-    let signed_options = get_cloudfront_signed_options(
+-        &state
+-            .config
+-            .document_storage_service_cloudfront_signer_public_key_id,
+-        state
+-            .config
+-            .document_storage_service_cloudfront_signer_private_key
+-            .as_ref(),
+-        state
+-            .config
+-            .document_storage_service_presigned_url_expiry_seconds,
+-    )?;
+-
+-    let signed_url = get_presigned_url(
+-        &state
+-            .config
+-            .document_storage_service_cloudfront_distribution_url,
+-        &document_key_url_path(key),
+-        &signed_options,
+-    )?;
++    let signed_url = document_object_url(&state.s3_client, &state.config, key).await?;
+ 
+     Ok(LocationResponseData::PresignedUrl(signed_url))
+ }
+@@ -219,6 +199,17 @@ async fn get_docx_urls(
+     };
+     tracing::debug!(elapsed = ?start_shas.elapsed(), "got document shas");
+ 
++    if macro_aws_config::is_local_aws() {
++        let mut presigned_urls = Vec::with_capacity(shas.len());
++        for sha in shas {
++            presigned_urls.push(PresignedUrl {
++                presigned_url: document_object_url(&state.s3_client, &state.config, &sha).await?,
++                sha,
++            });
++        }
++        return Ok(LocationResponseData::PresignedUrls(presigned_urls));
++    }
++
+     let signed_options = get_cloudfront_signed_options(
+         &state
+             .config
+diff --git a/services/document_storage_service/src/outbound/docx_export.rs b/services/document_storage_service/src/outbound/docx_export.rs
+index 98f86baa4..38323c898 100644
+--- a/services/document_storage_service/src/outbound/docx_export.rs
++++ b/services/document_storage_service/src/outbound/docx_export.rs
+@@ -4,11 +4,10 @@ use std::io::{Cursor, Write};
+ 
+ use documents_hex::domain::docx_export::DocxExportStore;
+ use model::document::BomPart;
+-use s3_key::document_key_url_path;
+ use sha2::{Digest, Sha256};
+ 
+ use crate::api::context::ApiContext;
+-use crate::service::cloudfront::{get_cloudfront_signed_options, get_presigned_url};
++use crate::service::cloudfront::document_object_url;
+ use crate::service::s3::S3;
+ 
+ #[derive(Debug, thiserror::Error)]
+@@ -69,23 +68,7 @@ impl DocxExportStore for ApiContext {
+         parts: Vec<BomPart>,
+     ) -> Result<String, Self::Err> {
+         let key = store_export(&self.s3_client, document_id, parts).await?;
+-        let signed_options = get_cloudfront_signed_options(
+-            &self
+-                .config
+-                .document_storage_service_cloudfront_signer_public_key_id,
+-            self.config
+-                .document_storage_service_cloudfront_signer_private_key
+-                .as_ref(),
+-            self.config
+-                .document_storage_service_presigned_url_expiry_seconds,
+-        )?;
+-        Ok(get_presigned_url(
+-            &self
+-                .config
+-                .document_storage_service_cloudfront_distribution_url,
+-            &document_key_url_path(&key),
+-            &signed_options,
+-        )?)
++        Ok(document_object_url(&self.s3_client, &self.config, &key).await?)
+     }
+ }
+ 
+diff --git a/services/document_storage_service/src/service/cloudfront.rs b/services/document_storage_service/src/service/cloudfront.rs
+index 32092bd0d..d8b8d6ba7 100644
+--- a/services/document_storage_service/src/service/cloudfront.rs
++++ b/services/document_storage_service/src/service/cloudfront.rs
+@@ -1,8 +1,42 @@
+ //! CloudFront signing shared by document locations and exports.
+ 
+ use cloudfront_sign::{SignedOptions, get_signed_url};
++use s3_key::document_key_url_path;
+ use std::time::{SystemTime, UNIX_EPOCH};
+ 
++use crate::config::Config;
++use crate::service::s3::S3;
++
++/// Download URL for `key` in the document storage bucket.
++///
++/// CloudFront-signed; in local mode an S3-presigned GET. Upstream returns the
++/// bare distribution URL in local mode, which only an S3 without access checks
++/// (LocalStack) serves.
++pub(crate) async fn document_object_url(
++    s3: &S3,
++    config: &Config,
++    key: &str,
++) -> anyhow::Result<String> {
++    let expiry_seconds = config.document_storage_service_presigned_url_expiry_seconds;
++    if macro_aws_config::is_local_aws() {
++        return s3
++            .get_document_storage_presigned_url(key, expiry_seconds)
++            .await;
++    }
++    let options = get_cloudfront_signed_options(
++        &config.document_storage_service_cloudfront_signer_public_key_id,
++        config
++            .document_storage_service_cloudfront_signer_private_key
++            .as_ref(),
++        expiry_seconds,
++    )?;
++    get_presigned_url(
++        &config.document_storage_service_cloudfront_distribution_url,
++        &document_key_url_path(key),
++        &options,
++    )
++}
++
+ /// Creates signed options for the cloudfront presigned url
+ #[tracing::instrument(skip(private_key), err)]
+ pub(crate) fn get_cloudfront_signed_options(
+diff --git a/services/document_storage_service/src/service/s3.rs b/services/document_storage_service/src/service/s3.rs
+index a8ae037c6..f2e414b80 100644
+--- a/services/document_storage_service/src/service/s3.rs
++++ b/services/document_storage_service/src/service/s3.rs
+@@ -69,6 +69,25 @@ impl S3Client {
+             .await
+     }
+ 
++    /// Browser-facing presigned GET for an object in the document storage bucket.
++    /// Local mode serves document content with it in place of a CloudFront URL.
++    pub async fn get_document_storage_presigned_url(
++        &self,
++        key: &str,
++        expiry_seconds: u64,
++    ) -> anyhow::Result<String> {
++        let presigned = self
++            .inner
++            .get_object()
++            .bucket(&self.document_storage_bucket)
++            .key(key)
++            .presigned(s3::presigning::PresigningConfig::expires_in(
++                std::time::Duration::from_secs(expiry_seconds),
++            )?)
++            .await?;
++        Ok(macro_aws_config::transform_aws_url(presigned.uri()))
++    }
++
+     pub async fn get_snapshot_presigned_url(&self, key: &str) -> anyhow::Result<String> {
+         internal_presigned_helpers::get_presigned_url(
+             &self.inner,

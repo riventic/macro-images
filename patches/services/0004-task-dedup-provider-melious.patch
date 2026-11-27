@@ -1,0 +1,269 @@
+diff --git a/crates/embedding/src/embedding_provider/openai.rs b/crates/embedding/src/embedding_provider/openai.rs
+index 60de1c66a..be2d151d2 100644
+--- a/crates/embedding/src/embedding_provider/openai.rs
++++ b/crates/embedding/src/embedding_provider/openai.rs
+@@ -44,6 +44,7 @@ fn truncate_for_embedding(text: &str) -> Cow<'_, str> {
+ /// An [`EmbeddingModel`] that calls OpenAI's embeddings API.
+ pub struct TextEmbedding3Small {
+     client: Client<OpenAIConfig>,
++    model: String,
+ }
+ 
+ impl TextEmbedding3Small {
+@@ -52,16 +53,33 @@ impl TextEmbedding3Small {
+     /// The key is used directly — nothing is read from the environment.
+     pub fn new(api_key: impl Into<String>) -> Self {
+         let config = OpenAIConfig::new().with_api_key(api_key);
+-        Self {
+-            client: Client::with_config(config),
+-        }
++        Self::with_client(Client::with_config(config))
+     }
+ 
+     /// Creates an embedder from a pre-configured OpenAI client.
+     ///
+     /// Use this to customize the API base, organization, HTTP client, etc.
+     pub fn with_client(client: Client<OpenAIConfig>) -> Self {
+-        Self { client }
++        Self {
++            client,
++            model: EMBEDDING_MODEL.to_owned(),
++        }
++    }
++
++    /// Creates an embedder for an OpenAI-compatible API at `api_base`, using
++    /// `model`. The model must return [`DIMS`] dimensions when asked for them.
++    pub fn openai_compatible(
++        api_key: impl Into<String>,
++        api_base: impl Into<String>,
++        model: impl Into<String>,
++    ) -> Self {
++        let config = OpenAIConfig::new()
++            .with_api_key(api_key)
++            .with_api_base(api_base);
++        Self {
++            client: Client::with_config(config),
++            model: model.into(),
++        }
+     }
+ }
+ 
+@@ -87,7 +105,7 @@ impl EmbeddingModel<DIMS> for TextEmbedding3Small {
+         }
+ 
+         let request = CreateEmbeddingRequestArgs::default()
+-            .model(EMBEDDING_MODEL)
++            .model(&self.model)
+             .input(EmbeddingInput::StringArray(
+                 fields.iter().map(|(_, text)| text.clone()).collect(),
+             ))
+diff --git a/crates/task_dedup/src/bin/backfill_task_embeddings.rs b/crates/task_dedup/src/bin/backfill_task_embeddings.rs
+index 2643e13b9..ea8315ac7 100644
+--- a/crates/task_dedup/src/bin/backfill_task_embeddings.rs
++++ b/crates/task_dedup/src/bin/backfill_task_embeddings.rs
+@@ -155,10 +155,7 @@ impl ResolvedConfig {
+     fn local() -> Result<Self> {
+         let vars = Vars::new()?;
+         Ok(Self {
+-            // The repo `.env` ships the docker-network DB host (`@postgres`),
+-            // which isn't resolvable from the host shell, so hardcode the
+-            // localhost URL for local runs.
+-            database_url: "postgres://user:password@localhost:5432/macrodb".to_string(),
++            database_url: vars.database_url.as_ref().to_string(),
+             // Resolve through macro_service_urls so local runs use the host-reachable URL.
+             lexical_service_url: Env::Local.lexical_service_url()?,
+             internal_api_secret_key: vars.internal_api_secret_key.as_ref().to_string(),
+@@ -276,7 +273,8 @@ impl Context {
+             .map_err(anyhow::Error::from)?;
+         let lexical =
+             LexicalClient::new(config.internal_api_secret_key, config.lexical_service_url);
+-        let embedder = TextEmbedding3Small::new(config.openai_api_key);
++        let embedder =
++            task_dedup::TaskDedupProvider::from_env()?.embedder(&config.openai_api_key)?;
+         let vector_db = PgTaskVectorDb::new(pg.clone());
+         Ok(Self {
+             pg,
+diff --git a/crates/task_dedup/src/lib.rs b/crates/task_dedup/src/lib.rs
+index 905781898..517bc2664 100644
+--- a/crates/task_dedup/src/lib.rs
++++ b/crates/task_dedup/src/lib.rs
+@@ -30,3 +30,90 @@ use outbound::postgres::PgTaskVectorDb;
+ /// axum state and handler signatures.
+ pub type PgTaskDedupService =
+     TaskDedupService<DIMS, TextEmbedding3Small, PgTaskVectorDb, CohereReranker>;
++
++/// Melious embedding model. Asked for [`DIMS`] dimensions, the pgvector column width.
++pub const MELIOUS_EMBEDDING_MODEL: &str = "qwen3-embedding-8b";
++/// Melious rerank model, served by a Cohere-compatible `/rerank`.
++pub const MELIOUS_RERANK_MODEL: &str = "qwen3-reranker-4b";
++const MELIOUS_BASE_URL: &str = "https://api.melious.ai/v1";
++
++/// The API that serves task-dedup embeddings and reranking, from
++/// `TASK_DEDUP_PROVIDER`. Unset is [`Self::OpenAi`].
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum TaskDedupProvider {
++    /// OpenAI `text-embedding-3-small` and Cohere rerank (upstream).
++    OpenAi,
++    /// Melious: [`MELIOUS_EMBEDDING_MODEL`] and [`MELIOUS_RERANK_MODEL`], with
++    /// `MELIOUS_API_KEY` and an optional `MELIOUS_BASE_URL`.
++    Melious,
++}
++
++impl TaskDedupProvider {
++    /// Reads `TASK_DEDUP_PROVIDER` (`openai` or `melious`). Any other value is an error.
++    pub fn from_env() -> anyhow::Result<Self> {
++        match std::env::var("TASK_DEDUP_PROVIDER").ok().as_deref() {
++            None | Some("openai") => Ok(Self::OpenAi),
++            Some("melious") => Ok(Self::Melious),
++            Some(other) => {
++                anyhow::bail!("TASK_DEDUP_PROVIDER={other}: want `openai` or `melious`")
++            }
++        }
++    }
++
++    /// The embedder. Only [`Self::OpenAi`] uses `openai_api_key`.
++    pub fn embedder(self, openai_api_key: &str) -> anyhow::Result<TextEmbedding3Small> {
++        match self {
++            Self::OpenAi => {
++                anyhow::ensure!(
++                    !openai_api_key.trim().is_empty(),
++                    "OpenAI API key is required for task dedup embeddings",
++                );
++                Ok(TextEmbedding3Small::new(openai_api_key))
++            }
++            Self::Melious => {
++                let (api_key, base_url) = melious_endpoint()?;
++                Ok(TextEmbedding3Small::openai_compatible(
++                    api_key,
++                    base_url,
++                    MELIOUS_EMBEDDING_MODEL,
++                ))
++            }
++        }
++    }
++
++    /// The reranker. Only [`Self::OpenAi`] uses `cohere_api_key`.
++    pub fn reranker(self, cohere_api_key: &str) -> anyhow::Result<CohereReranker> {
++        match self {
++            Self::OpenAi => {
++                anyhow::ensure!(
++                    !cohere_api_key.trim().is_empty(),
++                    "Cohere API key is required for task dedup reranking",
++                );
++                Ok(CohereReranker::new(cohere_api_key))
++            }
++            Self::Melious => {
++                let (api_key, base_url) = melious_endpoint()?;
++                Ok(CohereReranker::with_endpoint(
++                    api_key,
++                    format!("{base_url}/rerank"),
++                    MELIOUS_RERANK_MODEL,
++                ))
++            }
++        }
++    }
++}
++
++/// `MELIOUS_API_KEY` (required) and the base URL without a trailing slash.
++fn melious_endpoint() -> anyhow::Result<(String, String)> {
++    let api_key = std::env::var("MELIOUS_API_KEY").unwrap_or_default();
++    anyhow::ensure!(
++        !api_key.trim().is_empty(),
++        "TASK_DEDUP_PROVIDER=melious needs MELIOUS_API_KEY",
++    );
++    // Set but empty (`${MELIOUS_BASE_URL:-}` in compose) is unset.
++    let base_url = std::env::var("MELIOUS_BASE_URL")
++        .ok()
++        .filter(|url| !url.trim().is_empty())
++        .unwrap_or_else(|| MELIOUS_BASE_URL.to_owned());
++    Ok((api_key, base_url.trim_end_matches('/').to_owned()))
++}
+diff --git a/crates/task_dedup/src/outbound/cohere.rs b/crates/task_dedup/src/outbound/cohere.rs
+index 0d41f8290..c78ee5dbf 100644
+--- a/crates/task_dedup/src/outbound/cohere.rs
++++ b/crates/task_dedup/src/outbound/cohere.rs
+@@ -24,6 +24,7 @@ const COHERE_RERANK_URL: &str = "https://api.cohere.com/v2/rerank";
+ pub struct CohereReranker {
+     client: reqwest::Client,
+     api_key: String,
++    url: String,
+     model: String,
+ }
+ 
+@@ -39,9 +40,19 @@ impl CohereReranker {
+     /// Creates a reranker authenticated with `api_key` using an explicit Cohere
+     /// rerank model.
+     pub fn with_model(api_key: impl Into<String>, model: impl Into<String>) -> Self {
++        Self::with_endpoint(api_key, COHERE_RERANK_URL, model)
++    }
++
++    /// Creates a reranker for a Cohere-compatible rerank endpoint at `url`.
++    pub fn with_endpoint(
++        api_key: impl Into<String>,
++        url: impl Into<String>,
++        model: impl Into<String>,
++    ) -> Self {
+         Self {
+             client: reqwest::Client::new(),
+             api_key: api_key.into(),
++            url: url.into(),
+             model: model.into(),
+         }
+     }
+@@ -113,7 +124,7 @@ impl<const DIMS: usize> RerankModel<DIMS> for CohereReranker {
+ 
+         let response = self
+             .client
+-            .post(COHERE_RERANK_URL)
++            .post(&self.url)
+             .bearer_auth(&self.api_key)
+             .json(&json!({
+                 "model": self.model,
+diff --git a/services/document_storage_service/src/server.rs b/services/document_storage_service/src/server.rs
+index 998b68f53..3f17a62ae 100644
+--- a/services/document_storage_service/src/server.rs
++++ b/services/document_storage_service/src/server.rs
+@@ -87,7 +87,6 @@ use email::{
+     domain::{ports::ReadonlyEmailPreviewAdapter, service::EmailServiceImpl},
+     outbound::EmailPgRepo,
+ };
+-use embedding::embedding_provider::openai::TextEmbedding3Small;
+ use entity_registry::OwnerGrantPolicy;
+ use entity_registry_db_utils::OwnedEntityRegistrar;
+ use favorites::{
+@@ -188,9 +187,8 @@ use std::{sync::Arc, time::Duration};
+ use sync_service_client::SyncServiceClient;
+ use system_properties::{PgSystemPropertiesRepository, SystemPropertiesServiceImpl};
+ use task_dedup::{
+-    TaskDedupService,
++    TaskDedupProvider, TaskDedupService,
+     outbound::{
+-        cohere::CohereReranker,
+         connection_gateway::ConnectionGatewayTaskDedupNotifier,
+         judge::AgentDuplicateJudge,
+         postgres::{PgTaskMatchRepo, PgTaskVectorDb},
+@@ -1492,11 +1490,7 @@ async fn run_server() -> anyhow::Result<()> {
+         !openai_api_key.trim().is_empty(),
+         "OpenAI API key is required for task dedup embeddings and dictation",
+     );
+-    let cohere_api_key = config.cohere_api_key.as_ref().to_owned();
+-    anyhow::ensure!(
+-        !cohere_api_key.trim().is_empty(),
+-        "Cohere API key is required for task dedup reranking",
+-    );
++    let task_dedup_provider = TaskDedupProvider::from_env()?;
+     let dictation_state = dictation::inbound::axum_router::DictationRouterState::new(
+         dictation::domain::DictationServiceImpl::new(
+             dictation::outbound::WhisperTranscriber::new(&config.openai_api_key)?,
+@@ -1511,9 +1505,9 @@ async fn run_server() -> anyhow::Result<()> {
+         authorization_state.clone(),
+     );
+     let task_dedup_service = Arc::new(TaskDedupService::new(
+-        TextEmbedding3Small::new(openai_api_key),
++        task_dedup_provider.embedder(&openai_api_key)?,
+         PgTaskVectorDb::new(db.clone()),
+-        CohereReranker::new(cohere_api_key),
++        task_dedup_provider.reranker(config.cohere_api_key.as_ref())?,
+         Arc::new(AgentDuplicateJudge::new(
+             ai_usage::pg_recorder_with_enforcement(db.clone(), config.enable_ai_usage_enforcement),
+         )),
